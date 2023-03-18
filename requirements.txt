@@ -1,0 +1,6 @@
+numpy==1.18.3
+tqdm
+simple_pid
+pygame
+networkx
+shapely
