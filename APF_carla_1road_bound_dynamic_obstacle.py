@@ -11,6 +11,7 @@ from scripts.env import *
 from scripts.vehicle_obs import Vehicle
 from utils.draw_result import plot_result
 from utils.carla_utils import spawn_vehicles_around_ego_vehicles
+import random
 
 simu_step = 0.05
 gen_dis_max = 100
