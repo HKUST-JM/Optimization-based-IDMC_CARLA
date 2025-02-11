@@ -13,20 +13,19 @@ lf = 1.06  # m
 lr = 1.85  # m
 m = 1412  # kg
 Iz = 1536.7  # kg*m2s
-dt = None  # s
+dt = 0.1
 Lk = lf*kf - lr*kr  # = 22345.439999999973
 
 n_input = 2  # acc, steering
 
 
 class Vehicle:
-    def __init__(self, state=None, actor=None, horizon=10, target_v=18, carla=True, delta_t=0.05):
+    def __init__(self, state=None, actor=None, horizon=10, target_v=18, carla=True):
         '''
         state: x=0.0, y=0.0, yaw=0.0, v=0.0, direct=1.0
         '''
+        
         self.carla = carla
-        global dt
-        dt = delta_t
         if carla:
             self.actor = actor
             self.c_loc = self.actor.get_location()
@@ -48,13 +47,16 @@ class Vehicle:
 
         # param of MPC
         self.horizon = horizon
-        self.maxiter = 20
+        self.maxiter = 100
         # param of car state_dot
         self.omega = 0
         self.steer_bound = 0.6
-        self.acc_lbound = -6
-        self.acc_ubound = 3
+        self.acc_lbound = -3
+        self.acc_ubound = 1.5
         self.target_v = target_v / 3.6
+
+        self.obj = 0
+        self.g = []  # equal constrains for multi-shooting
 
     def get_state_carla(self):
         self.transform = self.actor.get_transform()
@@ -76,25 +78,8 @@ class Vehicle:
         # return self.vx/math.cos(self.yaw)
         if self.carla:
             self.get_state_carla()
-            return self.get_direction() * np.sqrt(self.vx**2+self.vy**2)
-        else:
-            return np.sqrt(self.vx**2+self.vy**2)
 
-    def get_direction(self):
-        '''
-        Get the direction of the vehicle's velocity
-        '''
-        yaw = np.radians(self.yaw)
-        v_yaw = math.atan2(self.velocity.y, self.velocity.x)
-        error = v_yaw - yaw
-        if error < -math.pi:
-            error += 2*math.pi
-        elif error > math.pi:
-            error -= 2*math.pi
-        error = abs(error)
-        if error > math.pi/2:
-            return -1
-        return 1
+        return np.sqrt(self.vx**2+self.vy**2)
 
     def set_state(self, next_state):
         _, _, _, self.vx, self.vy, self.omega = next_state
@@ -139,7 +124,7 @@ class Vehicle:
 
         return (x, y, yaw, vx, vy, omega)
 
-    def solver_basis(self, Q=np.diag([3, 3, 1, 1, 0]), R=np.diag([0.1, 0.1]), Rd=np.diag([1, 10.0])):
+    def solver_basis(self, Q=np.diag([3, 3, 0.1, 0.1, 0]), R=np.diag([0.1, 0.1]), Rd=np.diag([0.05, 10])):
         cx = ca.SX.sym('cx')
         cy = ca.SX.sym('cy')
         cyaw = ca.SX.sym('cyaw')
@@ -186,32 +171,51 @@ class Vehicle:
         self.X = ca.SX.sym('X', n_states, self.horizon+1)  # state
         self.P = ca.SX.sym('P', n_states, self.horizon+1)  # reference
 
+        self.sQ = Q
         self.Q = Q
+        self.sR = R
         self.R = R
+        self.sRd = Rd
         self.Rd = Rd
 
         self.opt_variables = ca.vertcat(ca.reshape(
             self.U, -1, 1), ca.reshape(self.X, -1, 1))
         
         self.Da = 1
-        self.ac_r = 0.5
+        self.ac_r = 0.1
         self.anc_r = 100
 
-    def solver_add_cost(self):
+    def solver_reset_cost(self):
         self.obj = 0
-        self.g = []  # equal constrains for multi-shooting
+        self.g = []
+
         self.lbg = []
         self.ubg = []
+
         self.lbx = []
         self.ubx = []
 
+    def solver_add_cost(self, tr_lgt=False):
+        # if tr_lgt == True:
+        if 0:
+        
+            self.Q = np.diag([10,10,0,0.01,0])
+            self.R = np.diag([0.1, 0.1])
+            self.Rd = np.diag([0, 0])
+        else:
+            self.Q = self.sQ
+            self.R = self.sR
+            self.Rd = self.sRd
+
+        # self.obj = 0
+        # self.g = []  # equal constrains for multi-shooting
         self.g.append(self.X[:, 0]-self.P[:, 0])
         # add objective function and equality constraints
         for i in range(self.horizon):
             state_error = (self.X[0:5, i]-self.P[0:5, i])
 
-            self.obj = self.obj + ca.mtimes([state_error.T, self.Q, state_error]) \
-                       + ca.mtimes([self.U[:, i].T, self.R, self.U[:, i]])
+            self.obj = self.obj + ca.mtimes([state_error.T, self.Q, state_error]) + \
+                       ca.mtimes([self.U[:, i].T, self.R, self.U[:, i]])
             if i < (self.horizon-1):
                 control_diff = self.U[:, i]-self.U[:, i+1]
                 self.obj = self.obj + \
@@ -219,239 +223,207 @@ class Vehicle:
             # x_next_ = self.predict(X[:,i], U[:,i])
             x_next_ = self.f(self.X[:, i], self.U[:, i])
             self.g.append(self.X[:, i+1]-x_next_)
-        self.obj += ca.mtimes([(self.X[0:5, self.horizon]-self.P[0:5, self.horizon]).T, self.Q, (self.X[0:5, self.horizon]-self.P[0:5, self.horizon])])
 
-    def get_obs_centers(self, ob_, radius=2.4, carla=False):
-        '''
-        [Right Coordinate System]
-        Get the centers of the two circles that represent the obstacle
-        Parameters:
-            ob_ : [x, y, yaw]
-            radius : radius of the obstacle
-        Returns:
-            obc1 : [x, y]
-            obc2 : [x, y]
-        '''
-        if carla:
-            obc1 = [ob_[0]+1.5*radius*np.cos(ob_[2]), ob_[1]+1.5*radius*np.sin(ob_[2])]
-            obc2 = [ob_[0]-radius*np.cos(ob_[2]), ob_[1]-radius*np.sin(ob_[2])]
-        else:
-            obc1 = [ob_[0]+radius*np.cos(ob_[2]), ob_[1]+radius*np.sin(ob_[2])]
-            obc2 = [ob_[0], ob_[1]]
-
+    def get_obs_centers(self, ob_, radius=2.5):
+        obc1 = [ob_[0]+radius*np.cos(ob_[2]), ob_[1]+radius*np.sin(ob_[2])]
+        obc2 = [ob_[0], ob_[1]]
         return obc1, obc2
 
-    def solver_add_soft_obs(self, obs, ratio=370, expn = 1, carla=False):
-        # self.obj = 0
+    def solver_add_soft_obs(self, obs, ratio=400):
         for i in range(self.horizon):
             for ob_ in obs:
-                obc = self.get_obs_centers(ob_, carla)
+                obc = self.get_obs_centers(ob_)
                 for obc_ in obc:
-                    for selfc in self.get_obs_centers(self.X[:, i], carla):
+                    for selfc in self.get_obs_centers(self.X[:, i]):
                         # dist = ca.sqrt((selfc[0]-obc_[0])**2+\
                         #     (selfc[1]-obc_[1])**2)
                         dist = (selfc[0]-obc_[0])**2+(selfc[1]-obc_[1])**2
-                        self.obj += (1/dist)**expn*ratio
+                        add_obj = (1/dist)*ratio
+                        self.obj = self.obj + add_obj
 
-    def soft_obs_apf(self, obs, ref_traj, ratio=370, expn=1, carla=False):
-        obs_apf = 0
-        for ob_ in obs:
-            obc = self.get_obs_centers(ob_, carla)
-            for obc_ in obc:
-                for selfc in self.get_obs_centers(ref_traj[:, 0], carla):
-                    # dist = ca.sqrt((selfc[0]-obc_[0])**2+\
-                    #     (selfc[1]-obc_[1])**2)
-                    dist = (selfc[0]-obc_[0])**2+(selfc[1]-obc_[1])**2
-                    obs_apf += (1/dist)**expn*ratio
-        
-        return obs_apf
-
-    # MPC Soler construction
-    def solver_add_hard_obs(self, obs, carla=False):
+    def for_comparison_solver_add_soft_obs(self, obs, ratio=2000):
         for i in range(self.horizon):
             for ob_ in obs:
-                obc = self.get_obs_centers(ob_, carla)
+                obc = self.get_obs_centers(ob_)
                 for obc_ in obc:
-                    for selfc in self.get_obs_centers(self.X[:, i], carla):
+                    for selfc in self.get_obs_centers(self.X[:, i]):
+                        add_obj = ratio * ca.exp(-(selfc[0]-obc_[0])**2-(selfc[1]-obc_[1])**2)
+                        self.obj = self.obj + add_obj
+
+    def solver_add_hard_obs(self, obs):
+        for i in range(self.horizon+1):
+            for ob_ in obs:
+                obc = self.get_obs_centers(ob_)
+                for obc_ in obc:
+                    for selfc in self.get_obs_centers(self.X[:, i]):
                         dist = ca.sqrt((selfc[0]-obc_[0])**2 +
                                        (selfc[1]-obc_[1])**2)
                         self.g.append(dist)
                         self.ubg.append(np.inf)
-                        self.lbg.append(0.5)
+                        self.lbg.append(4.8)
 
-
-    def solver_add_c_road_pf(self, roads_pos, yaw=0, carla=False):
-        '''
-        [Right Coordinate System]
-        Add the cost function for the crossable road lane
-        Parameters:
-            roads_pos : [y1, y2, y3, ...]
-            yaw : yaw of the vehicle
-        Returns:
-            None
-        '''
+    def solver_add_c_road_pf(self, roads_pos, yaw=0):
         for i in range(self.horizon):
             for road_pos in roads_pos:
-                for selfc in self.get_obs_centers(self.X[:, i], carla):
+                for selfc in self.get_obs_centers(self.X[:, i]):
                     selfc = [0, ca.sin(-yaw)*selfc[0]+ca.cos(-yaw)*selfc[1]]
                     dist = ca.fabs(selfc[1] - road_pos)
 
-                # Standard Road Lane PF
-                self.obj = self.obj + ca.if_else(
-                    dist < 0.5,
-                    self.ac_r * (dist-1)**2,
-                    0)
-                
+                    # Standard Road Lane PF
+                    self.obj = self.obj + ca.if_else(
+                        dist < 0.5,
+                        self.ac_r * (dist-1)**2,
+                        0)
+        # self.x_m = np.zeros((self.n_states, self.horizon+1))
+        # self.next_states = self.x_m.copy().T
 
-    def c_road_pf(self, roads_pos, ref_traj, yaw=0, carla=False):
-        road_pf = 0
-        for road_pos in roads_pos:
-            for selfc in self.get_obs_centers(ref_traj[:, 0], carla):
-                selfc = [0, np.sin(-yaw)*selfc[0]+np.cos(-yaw)*selfc[1]]
-                dist = np.fabs(selfc[1] - road_pos)
-
-            # Standard Road Lane PF
-            if dist < 0.5:
-                road_pf += self.ac_r * (dist-1)**2
-
-        return road_pf
-
-
-    def solver_add_nc_road_pf(self, roads_pos, yaw=0, carla=False):
-        '''
-        [Right Coordinate System]
-        Add the cost function for the noncrossable road lane
-        Parameters:
-            roads_pos : [y1, y2, y3, ...]
-            yaw : yaw of the vehicle
-        Returns:
-            None
-        '''
+    def solver_add_nc_road_pf(self, roads_pos, yaw=0):
         for i in range(self.horizon):
             for road_pos, dir in roads_pos:
-                for selfc in self.get_obs_centers(self.X[:, i], carla):
+                for selfc in self.get_obs_centers(self.X[:, i]):
                     selfc = [0, (ca.sin(-yaw)*selfc[0]+ca.cos(-yaw)*selfc[1])]
                     dist = ca.fabs(selfc[1] - road_pos)
                     
                     ## Use reciprocal PF
                     self.obj = self.obj + \
                         ca.if_else(
-                            dist < 1.5,
+                            dist < 2,
                             ca.if_else(dir == 1,
-                                ca.if_else(selfc[1] > road_pos-0.2, 
-                                        1000, 
+                                ca.if_else(selfc[1] > road_pos-0.1, 
+                                        10000000, 
                                         self.anc_r * (1/ca.fabs(selfc[1] - road_pos))**2),
-                                ca.if_else(selfc[1] < road_pos+0.2, 
-                                        1000, 
+                                ca.if_else(selfc[1] < road_pos+0.1, 
+                                        10000000, 
                                         self.anc_r * (1/ca.fabs(selfc[1] - road_pos))**2)
                                 ),
                             0
                         )
-        
 
-    def nc_road_pf(self, roads_pos, ref_traj, yaw=0, carla=False):
-        nc_road_pf = 0
-  
-        for road_pos, dir in roads_pos:
-            for selfc in self.get_obs_centers(ref_traj[:, 0], carla):
-                selfc = [0, (np.sin(-yaw)*selfc[0]+np.cos(-yaw)*selfc[1])]
-                dist = np.fabs(selfc[1] - road_pos)
-                
-                ## Use reciprocal PF
-                if dist < 1.5:
-                    if dir == 1:
-                        if selfc[1] > road_pos-0.2:
-                            nc_road_pf += 1000
-                        else:
-                            nc_road_pf += self.anc_r * (1/np.fabs(selfc[1] - road_pos))**2
-                    else:
-                        if selfc[1] < road_pos+0.2:
-                            nc_road_pf += 1000
-                        else:
-                            nc_road_pf += self.anc_r * (1/np.fabs(selfc[1] - road_pos))**2
-        
-        return nc_road_pf
+
                     
 
+    def solver_add_expnc_road_pf(self, roads_pos):
+        for i in range(self.horizon):
+            for road_pos in roads_pos:
+                for selfc in self.get_obs_centers(self.X[:, i]):
+                    dist = ca.fabs(selfc[1] - road_pos)
+                    # self.obj = self.obj + self.anc_r * (1/(selfc[1] - road_pos)**2)
+
+                    ## Use reciprocal PF
+                    # self.obj = self.obj + ca.if_else(
+                    # ca.fabs(selfc[1] - road_pos) < 1.5,
+                    # self.anc_r * (1/ca.fabs(selfc[1] - road_pos)),
+                    # 0)
+
+                    ## Use Exponential PF
+                    self.obj = self.obj + ca.if_else(
+                        selfc[1] < road_pos,
+                        ca.exp(self.anc_r*(selfc[1])),
+                        ca.exp(self.anc_r*(-selfc[1]))
+                    )
+
     def solver_add_single_tr_lgt_pf(self, light_pos):
-        '''
-        Add traffic light cost function
-        Parameters:
-            light_pos : [x] 
-        '''
         for i in range(self.horizon):
             dist = -(self.X[:, i][0] - light_pos)
             dist_l = 1.5 - self.X[:, i][1]
             dist_r = self.X[:, i][1] + 1.5
             
+            # self.g.append(dist)
+            # self.g.append(dist_l)
+            # self.g.append(dist_r)
+            
+            # self.obj = self.obj + selfc[0][1]**8 + (selfc[0][0]-light_pos)**2 + (selfc[0][0]-light_pos - 1)**4
             self.obj = self.obj + 200*(1/(dist)) + 1000*(1/(dist_l))**2 + 1000*(1/(dist_r))**2 
-    
+            
+            ## sigmoid
+            # dist = selfc[0][0]-light_pos
+            # self.obj = self.obj + 1000000* (ca.exp(dist)/(1+ca.exp(dist)))**2
 
-    def solver_add_single_tr_lgt_pf_carla(self, lane_center_y, yaw, tl_x):
-        '''
-        Add traffic light cost function in Carla
-        Parameters: 
-            lane_center_y : y coordinate of the lane center
-            yaw : yaw of the lane center point
-        Returns:
-            None
-        '''
+    def solver_add_soft_obs(self, obs, ratio=400):
         for i in range(self.horizon):
-            selfc = [ca.cos(-yaw)*self.X[:, i][0] - ca.sin(-yaw)*self.X[:, i][1],
-                     ca.sin(-yaw)*self.X[:, i][0] + ca.cos(-yaw)*self.X[:, i][1]]
-            dist = -(selfc[0] - tl_x) + 1.5
-            dist_l = 1.5 - (selfc[1]-lane_center_y)
-            dist_r = (selfc[1]-lane_center_y) + 1.5
+            for ob_ in obs:
+                obc = self.get_obs_centers(ob_)
+                for obc_ in obc:
+                    for selfc in self.get_obs_centers(self.X[:, i]):
+                        # dist = ca.sqrt((selfc[0]-obc_[0])**2+\
+                        #     (selfc[1]-obc_[1])**2)
+                        dist = (selfc[0]-obc_[0])**2+(selfc[1]-obc_[1])**2
+                        add_obj = (1/dist)*ratio
+                        self.obj = self.obj + add_obj
 
-            self.obj += 200*(1/(dist)) + 1000*(1/(dist_l))**2 + 1000*(1/(dist_r))**2
+    def solver_update_param(self, Q, R, dR):
+        if Q != None:
+            self.Q = Q
+        if R != None:
+            self.R = R
+        if dR != None:
+            self.dR = dR
+                    
 
-    def traffic_pf(self, ref_traj, lane_center_y, yaw, tl_x):
-        traffic_pf = 0
- 
-        selfc = [np.cos(-yaw)*ref_traj[0, 0] - np.sin(-yaw)*ref_traj[1, 0],
-                    np.sin(-yaw)*ref_traj[0, 0] + np.cos(-yaw)*ref_traj[1, 0]]
-        dist = -(selfc[0] - tl_x) + 2
-        dist_l = 1.5 - (selfc[1]-lane_center_y)
-        dist_r = (selfc[1]-lane_center_y) + 1.5
+    def solver_add_bounds(self, tr_lgt = False):
+        # if tr_lgt == True:
+        #     self.Q = np.diag([0,0,0,0,0])
+        # else:
+        #     self.Q = self.sQ
 
-            # traffic_pf += 200*(1/(dist)) + 1000*(1/(dist_l))**2 + 1000*(1/(dist_r))**2
-        traffic_pf = 200*(1/(dist))
-        return traffic_pf
-        
-
-    def solver_add_bounds(self, obs=np.array([])):
         nlp_prob = {'f': self.obj, 'x': self.opt_variables, 'p': self.P,
                     'g': ca.vertcat(*self.g)}
 
         opts_setting = {'ipopt.max_iter': self.maxiter, 'ipopt.print_level': 0, 'print_time': 0,
-                        'ipopt.acceptable_tol': 1e-8, 'ipopt.acceptable_obj_change_tol': 1e-6}
+                        'ipopt.acceptable_tol': 1e-4, 'ipopt.acceptable_obj_change_tol': 1e-5}
 
         self.solver = ca.nlpsol('solver', 'ipopt', nlp_prob, opts_setting)
+        
+        # sqp_settings = dict(qpsol='qrqp', qpsol_options={'print_iter':True, 'max_iter':100, 'error_on_fail':False},\
+        #                     print_time=True, max_iter=10,max_iter_ls=100)
+        # self.solver = ca.nlpsol('solver', 'sqpmethod', nlp_prob, sqp_settings)
+
 
         for _ in range(self.horizon+1):
             for _ in range(self.n_states):
                 self.lbg.append(0.0)
                 self.ubg.append(0.0)
 
+        r_ego = 1.4
+        r_other = 1.56  # 1.1*np.sqrt(2)
+        dis = r_other + r_ego
 
-        for _ in range((self.horizon+1)*obs.shape[0]*2):
-            self.lbg.append(0)
-            self.lbg.append(0)
 
-            self.ubg.append(np.inf)
-            self.ubg.append(np.inf)
+        # if switch on hard constraint of traffic light, this code should be active
+        # if tr_lgt == True:
+        #     for _ in range(self.horizon):
+        #         self.lbg.append(0)
+        #         self.lbg.append(0)
+        #         # self.lbg.append(0)
+        #         # self.lbg.append(dis)
+
+        #         self.ubg.append(np.inf)
+        #         self.ubg.append(np.inf)
+        #         # self.ubg.append(np.inf)
+        #         # self.ubg.append(np.inf)
 
         for _ in range(self.horizon):
-            self.lbx.append(self.acc_lbound)
-            self.lbx.append(-self.steer_bound)
+            # if tr_lgt == True:
+            #     self.lbx.append(-0.5)
+            #     self.lbx.append(-0.5)
 
-            self.ubx.append(self.acc_ubound)
-            self.ubx.append(self.steer_bound)
+            #     self.ubx.append(0.5)
+            #     self.ubx.append(0.5)
+            # else:
+                self.lbx.append(self.acc_lbound)
+                self.lbx.append(-self.steer_bound)
+
+                self.ubx.append(self.acc_ubound)
+                self.ubx.append(self.steer_bound)
 
         for _ in range(self.horizon+1):
             self.lbx.append(-np.inf)
             self.lbx.append(-np.inf)
             self.lbx.append(-np.inf)
+            # if tr_lgt == False:
+            #     self.lbx.append(-self.target_v)
+            # else:
+            #     self.lbx.append(-0.1)
             self.lbx.append(-self.target_v)
             self.lbx.append(-np.inf)
             self.lbx.append(-np.inf)
@@ -459,6 +431,10 @@ class Vehicle:
             self.ubx.append(np.inf)
             self.ubx.append(np.inf)
             self.ubx.append(np.inf)
+            # if tr_lgt == False:
+            #     self.ubx.append(self.target_v)
+            # else:
+            #     self.ubx.append(0.1)
             self.ubx.append(self.target_v)
             self.ubx.append(np.inf)
             self.ubx.append(np.inf)
@@ -466,6 +442,7 @@ class Vehicle:
     '''
     MPC solver without initialized u_opt from last iteration of MPC
     '''
+
     def solve_MPC_wo(self, z_ref, z0, a_opt, delta_opt):
         xs = z_ref
         x0 = z0
@@ -495,6 +472,7 @@ class Vehicle:
     '''
     MPC solver with initialized u_opt from last iteration of MPC
     '''
+
     def solve_MPC(self, z_ref, z0, n_states, u0):
         xs = z_ref
         x_m = n_states
